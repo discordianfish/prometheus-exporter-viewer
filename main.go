@@ -15,12 +15,13 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"mime"
 	"net/http"
-	"os"
 	"runtime"
 
 	"github.com/matttproud/golang_protobuf_extensions/ext"
@@ -29,7 +30,77 @@ import (
 	dto "github.com/prometheus/client_model/go"
 )
 
-const acceptHeader = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3`
+const (
+	acceptHeader  = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3`
+	graphTemplate = `<html>
+	<head>
+		<script src="//cdnjs.cloudflare.com/ajax/libs/d3/3.4.11/d3.min.js"></script>
+		<script src="//cdnjs.cloudflare.com/ajax/libs/rickshaw/1.4.6/rickshaw.min.js"></script>
+	</head>
+	<body>
+		<div id="chart"></div>
+		<script>
+			var interval = 3000;
+			var maxPoints = 100;
+			var graph = new Rickshaw.Graph({
+				element: document.querySelector("#chart"), 
+				series: new Rickshaw.Series.FixedDuration([{ name: 'one' }], undefined, {
+					timeInterval: interval,
+					maxDataPoints: maxPoints,
+					timeBase: new Date().getTime() / 1000
+				})
+			})
+
+			var httpRequest;
+			if (window.XMLHttpRequest) { // Mozilla, Safari, ...
+				httpRequest = new XMLHttpRequest();
+			} else if (window.ActiveXObject) { // IE 8 and older
+		  		httpRequest = new ActiveXObject("Microsoft.XMLHTTP");
+			}
+		
+			var ticker = window.setInterval(function() {
+				httpRequest.onreadystatechange = updateGraph
+				httpRequest.open('GET', window.location, true);
+				httpRequest.setRequestHeader("Accept", "application/json")
+				httpRequest.send(null);
+			}, interval)
+		    
+			function updateGraph() {
+				if (httpRequest.readyState === 4) {
+					graph.series.addData(transform(httpRequest.responseText))
+					graph.render();
+		      		}
+		    	}
+
+			function transform(data) {
+				json = JSON.parse(data);
+				var palette = new Rickshaw.Color.Palette();
+				
+				var series = {}
+				for (var mi in json) {
+					if (json[mi]['type'] == "SUMMARY") {
+						continue
+					}
+					for (var di in json[mi]['metrics']) {
+						for (var key in json[mi]['metrics'][di]['labels']) {
+							var name = json[mi]['name'] + '{' + key + '=' + json[mi]['metrics'][di]['labels'][key] + '}'
+							series[name] = parseFloat(json[mi]['metrics'][di]['value'])
+						}
+					}
+				}
+				console.log(series)
+				return series
+			}
+		</script>
+	</body>
+</html>`
+)
+
+var (
+	addr = flag.String("addr", ":8000", "Address to listen on")
+
+	templates = template.Must(template.New("graph").Parse(graphTemplate))
+)
 
 type metricFamily struct {
 	Name    string        `json:"name"`
@@ -151,26 +222,40 @@ func fetchMetricFamilies(url string, ch chan<- *dto.MetricFamily) {
 	}
 }
 
-func main() {
-	runtime.GOMAXPROCS(2)
-	if len(os.Args) != 2 {
-		log.Fatalf("Usage: %s METRICS_URL", os.Args[0])
-	}
-
+func handleJson(w http.ResponseWriter, r *http.Request) {
 	mfChan := make(chan *dto.MetricFamily, 1024)
+	if len(r.URL.Path) < 2 {
+		http.Error(w, "expect exporter url in path", http.StatusBadGateway)
+		return
+	}
+	exporterUrl := fmt.Sprintf("http://%s", r.URL.Path[1:])
 
-	go fetchMetricFamilies(os.Args[1], mfChan)
+	go fetchMetricFamilies(exporterUrl, mfChan)
 
 	result := []*metricFamily{}
 	for mf := range mfChan {
 		result = append(result, newMetricFamily(mf))
 	}
-	json, err := json.Marshal(result)
-	if err != nil {
-		log.Fatalln("error marshaling JSON:", err)
+	encoder := json.NewEncoder(w)
+	if err := encoder.Encode(result); err != nil {
+		log.Println(err.Error())
 	}
-	if _, err := os.Stdout.Write(json); err != nil {
-		log.Fatalln("error writing to stdout:", err)
+}
+
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+	log.Println("<", r.URL)
+	accept := r.Header.Get("Accept")
+	if accept == "application/json" {
+		handleJson(w, r)
+		return
 	}
-	fmt.Println()
+	templates.Execute(w, nil)
+}
+
+func main() {
+	flag.Parse()
+	http.HandleFunc("/", handleRequest)
+	runtime.GOMAXPROCS(2) // Why?
+
+	log.Fatal(http.ListenAndServe(*addr, nil))
 }
